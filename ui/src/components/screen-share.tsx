@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useMemo } from "react";
 import {
   Tooltip,
   TooltipContent,
@@ -7,13 +7,12 @@ import {
 } from "@/components/ui/tooltip";
 
 /**
- * Internal component that renders and captures screen sharing feed.
- * Handles both display and stream capture in a single canvas element,
- * maintaining aspect ratio while fitting within bounds.
+ * Canvas component that handles rendering of screen sharing with selection capabilities
  */
 function StreamCanvas({
   stream,
   frameRate,
+  onStreamReady,
 }: {
   stream: MediaStream | null;
   frameRate: number;
@@ -21,19 +20,49 @@ function StreamCanvas({
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const animationRef = useRef<number>(0);
+  const [canvasSize, setCanvasSize] = useState({ width: 1280, height: 720 });
+  
+  // Selection state
   const [isSelecting, setIsSelecting] = useState(false);
+  const [selectionStart, setSelectionStart] = useState<{x: number, y: number} | null>(null);
   const [boundingBox, setBoundingBox] = useState<{
     startX: number;
     startY: number;
     endX: number;
     endY: number;
   } | null>(null);
-  const [selectionStart, setSelectionStart] = useState<{x: number, y: number} | null>(null);
   const [showFullScreen, setShowFullScreen] = useState(true);
+
+  // Draw state info
+  const drawInfo = useRef<{
+    offsetX: number;
+    offsetY: number;
+    drawWidth: number;
+    drawHeight: number;
+    scaleX: number;
+    scaleY: number;
+  } | null>(null);
+
+  // Convert canvas coordinates to video coordinates
+  const canvasToVideoCoords = useCallback((canvasX: number, canvasY: number) => {
+    const info = drawInfo.current;
+    if (!info || !videoRef.current) return { x: 0, y: 0 };
+    
+    // Adjust for canvas offset where the video is drawn
+    const adjustedX = canvasX - info.offsetX;
+    const adjustedY = canvasY - info.offsetY;
+    
+    // Apply scale to get video coordinates
+    return {
+      x: adjustedX * info.scaleX,
+      y: adjustedY * info.scaleY
+    };
+  }, []);
 
   // Handle mouse down to start bounding box selection
   const handleMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (!canvasRef.current) return;
+    if (!canvasRef.current || !stream || stream.getVideoTracks().length === 0) return;
     
     const canvas = canvasRef.current;
     const rect = canvas.getBoundingClientRect();
@@ -42,11 +71,12 @@ function StreamCanvas({
     
     setIsSelecting(true);
     setSelectionStart({x, y});
-    // Reset the current bounding box while selecting
+    
+    // Reset the current bounding box while selecting a new region
     if (showFullScreen) {
       setBoundingBox(null);
     }
-  }, [showFullScreen]);
+  }, [showFullScreen, stream]);
 
   // Handle mouse move to update bounding box during selection
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -57,6 +87,7 @@ function StreamCanvas({
     const x = (e.clientX - rect.left) * (canvas.width / rect.width);
     const y = (e.clientY - rect.top) * (canvas.height / rect.height);
     
+    // Update bound box in real-time
     setBoundingBox({
       startX: selectionStart.x,
       startY: selectionStart.y,
@@ -68,21 +99,33 @@ function StreamCanvas({
   // Handle mouse up to finalize bounding box selection
   const handleMouseUp = useCallback(() => {
     if (isSelecting && boundingBox) {
-      // Normalize coordinates (ensure startX < endX and startY < endY)
-      const normalizedBox = {
-        startX: Math.min(boundingBox.startX, boundingBox.endX),
-        startY: Math.min(boundingBox.startY, boundingBox.endY),
-        endX: Math.max(boundingBox.startX, boundingBox.endX),
-        endY: Math.max(boundingBox.startY, boundingBox.endY)
-      };
+      // Minimum selection size (10x10 pixels)
+      const minSize = 10;
+      const width = Math.abs(boundingBox.endX - boundingBox.startX);
+      const height = Math.abs(boundingBox.endY - boundingBox.startY);
       
-      setBoundingBox(normalizedBox);
-      setShowFullScreen(false);
+      if (width < minSize || height < minSize) {
+        // If selection is too small, ignore it
+        if (showFullScreen) {
+          setBoundingBox(null);
+        }
+      } else {
+        // Normalize coordinates (ensure startX < endX and startY < endY)
+        const normalizedBox = {
+          startX: Math.min(boundingBox.startX, boundingBox.endX),
+          startY: Math.min(boundingBox.startY, boundingBox.endY),
+          endX: Math.max(boundingBox.startX, boundingBox.endX),
+          endY: Math.max(boundingBox.startY, boundingBox.endY)
+        };
+        
+        setBoundingBox(normalizedBox);
+        setShowFullScreen(false);
+      }
     }
     
     setIsSelecting(false);
     setSelectionStart(null);
-  }, [isSelecting, boundingBox]);
+  }, [isSelecting, boundingBox, showFullScreen]);
 
   // Reset bounding box and show full screen again
   const resetBoundingBox = useCallback(() => {
@@ -90,110 +133,138 @@ function StreamCanvas({
     setShowFullScreen(true);
   }, []);
 
-  // Set up canvas animation for screen sharing
+  // Update canvas size on window resize
   useEffect(() => {
-    if (!stream || stream.getVideoTracks().length === 0) {
+    const handleResize = () => {
+      if (canvasRef.current) {
+        // Maintain 16:9 aspect ratio while updating size
+        setCanvasSize({
+          width: 1280,
+          height: 720
+        });
+      }
+    };
+
+    window.addEventListener('resize', handleResize);
+    handleResize();
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  // Draw function for rendering video on canvas
+  const drawVideoFrame = useCallback(() => {
+    const canvas = canvasRef.current;
+    const video = videoRef.current;
+    const ctx = canvas?.getContext('2d', { alpha: false });
+    
+    if (!canvas || !ctx || !video || !video.videoWidth) {
       return;
     }
 
-    const canvas = canvasRef.current!;
-    const ctx = canvas.getContext("2d")!;
-    const video = videoRef.current!;
+    // Clear canvas
+    ctx.fillStyle = "black";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    let isActive = true;
-    
-    const drawFrame = () => {
-      if (!isActive || !video) {
-        return;
-      }
+    // Calculate scaling to maintain aspect ratio
+    const canvasAspect = canvas.width / canvas.height;
+    const videoAspect = video.videoWidth / video.videoHeight;
+    let drawWidth = canvas.width;
+    let drawHeight = canvas.height;
+    let offsetX = 0;
+    let offsetY = 0;
+
+    if (videoAspect > canvasAspect) {
+      // Video is wider than canvas
+      drawHeight = canvas.width / videoAspect;
+      offsetY = (canvas.height - drawHeight) / 2;
+    } else {
+      // Video is taller than canvas
+      drawWidth = canvas.height * videoAspect;
+      offsetX = (canvas.width - drawWidth) / 2;
+    }
+
+    // Save drawing information for coordinate conversion
+    const scaleX = video.videoWidth / drawWidth;
+    const scaleY = video.videoHeight / drawHeight;
+    drawInfo.current = { offsetX, offsetY, drawWidth, drawHeight, scaleX, scaleY };
+
+    if (showFullScreen || !boundingBox) {
+      // Draw the full video frame
+      ctx.drawImage(video, offsetX, offsetY, drawWidth, drawHeight);
+    } else {
+      // Draw only the selected region
+      const vidBoxX = (boundingBox.startX - offsetX) * scaleX;
+      const vidBoxY = (boundingBox.startY - offsetY) * scaleY;
+      const vidBoxWidth = (boundingBox.endX - boundingBox.startX) * scaleX;
+      const vidBoxHeight = (boundingBox.endY - boundingBox.startY) * scaleY;
       
-      if (!video?.videoWidth) {
-        requestAnimationFrame(drawFrame);
-        return;
-      }
-
-      // Clear canvas
-      ctx.fillStyle = "black";
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-      if (showFullScreen || !boundingBox) {
-        // Calculate scaling to maintain aspect ratio (full frame)
-        const canvasAspect = canvas.width / canvas.height;
-        const videoAspect = video.videoWidth / video.videoHeight;
-        let drawWidth = canvas.width;
-        let drawHeight = canvas.height;
-        let offsetX = 0;
-        let offsetY = 0;
-
-        if (videoAspect > canvasAspect) {
-          // Video is wider than canvas
-          drawHeight = canvas.width / videoAspect;
-          offsetY = (canvas.height - drawHeight) / 2;
-        } else {
-          // Video is taller than canvas
-          drawWidth = canvas.height * videoAspect;
-          offsetX = (canvas.width - drawWidth) / 2;
-        }
-
-        ctx.drawImage(video, offsetX, offsetY, drawWidth, drawHeight);
-      } else {
-        // Draw only the portion within the bounding box
-        const canvasAspect = canvas.width / canvas.height;
-        const videoAspect = video.videoWidth / video.videoHeight;
-        
-        // Calculate the scaling factors between video and canvas
-        let drawWidth = canvas.width;
-        let drawHeight = canvas.height;
-        let offsetX = 0;
-        let offsetY = 0;
-
-        if (videoAspect > canvasAspect) {
-          // Video is wider than canvas
-          drawHeight = canvas.width / videoAspect;
-          offsetY = (canvas.height - drawHeight) / 2;
-        } else {
-          // Video is taller than canvas
-          drawWidth = canvas.height * videoAspect;
-          offsetX = (canvas.width - drawWidth) / 2;
-        }
-
-        // Convert bounding box from canvas to video coordinates
-        const scaleX = video.videoWidth / drawWidth;
-        const scaleY = video.videoHeight / drawHeight;
-        
-        const vidBoxX = (boundingBox.startX - offsetX) * scaleX;
-        const vidBoxY = (boundingBox.startY - offsetY) * scaleY;
-        const vidBoxWidth = (boundingBox.endX - boundingBox.startX) * scaleX;
-        const vidBoxHeight = (boundingBox.endY - boundingBox.startY) * scaleY;
-        
-        // Draw the cropped region to fill the canvas
+      // Make sure we're not trying to draw outside the video bounds
+      if (vidBoxX >= 0 && vidBoxY >= 0 && 
+          vidBoxWidth > 0 && vidBoxHeight > 0 && 
+          vidBoxX + vidBoxWidth <= video.videoWidth && 
+          vidBoxY + vidBoxHeight <= video.videoHeight) {
         ctx.drawImage(
           video, 
           vidBoxX, vidBoxY, vidBoxWidth, vidBoxHeight, // Source rectangle
           0, 0, canvas.width, canvas.height // Destination rectangle
         );
+      } else {
+        // Fallback to full frame if coordinates are invalid
+        console.warn("[ScreenShare] Invalid region selection, showing full frame");
+        ctx.drawImage(video, offsetX, offsetY, drawWidth, drawHeight);
+        resetBoundingBox();
       }
+    }
+    
+    // Draw selection overlay while selecting
+    if (isSelecting && selectionStart && boundingBox) {
+      // Semi-transparent overlay on the entire canvas except the selection
+      ctx.fillStyle = "rgba(0, 0, 0, 0.5)";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
       
-      // Draw bounding box overlay while selecting
-      if (isSelecting && selectionStart && boundingBox) {
-        ctx.strokeStyle = "red";
-        ctx.lineWidth = 2;
-        ctx.strokeRect(
-          boundingBox.startX,
-          boundingBox.startY,
-          boundingBox.endX - boundingBox.startX,
-          boundingBox.endY - boundingBox.startY
-        );
-      }
+      // Clear the selected area to make it visible
+      ctx.clearRect(
+        boundingBox.startX,
+        boundingBox.startY,
+        boundingBox.endX - boundingBox.startX,
+        boundingBox.endY - boundingBox.startY
+      );
       
-      requestAnimationFrame(drawFrame);
+      // Draw red border around selection
+      ctx.strokeStyle = "red";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(
+        boundingBox.startX,
+        boundingBox.startY,
+        boundingBox.endX - boundingBox.startX,
+        boundingBox.endY - boundingBox.startY
+      );
+    }
+  }, [boundingBox, isSelecting, resetBoundingBox, selectionStart, showFullScreen]);
+
+  // Set up animation loop for canvas drawing
+  useEffect(() => {
+    if (!stream || stream.getVideoTracks().length === 0) {
+      return;
+    }
+
+    let isActive = true;
+    
+    const animate = () => {
+      if (!isActive) return;
+      
+      drawVideoFrame();
+      animationRef.current = requestAnimationFrame(animate);
     };
-    drawFrame();
+    
+    animate();
 
     return () => {
       isActive = false;
+      if (animationRef.current) {
+        cancelAnimationFrame(animationRef.current);
+      }
     };
-  }, [stream, isSelecting, selectionStart, boundingBox, showFullScreen]);
+  }, [stream, drawVideoFrame]);
 
   // Set up video element when stream is available
   useEffect(() => {
@@ -202,25 +273,74 @@ function StreamCanvas({
     }
     
     const video = videoRef.current;
+    let isActive = true;
+    
+    // Clean up previous video state
+    if (video.srcObject) {
+      video.pause();
+      video.srcObject = null;
+    }
+    
     video.srcObject = stream;
     
-    video.onloadedmetadata = () => {
-      video.play().catch((error) => {
-        console.error("Screen sharing video play failed:", error);
-      });
+    // Create a safe play function that handles errors
+    const safePlay = async () => {
+      if (!isActive || !video) return;
+      
+      try {
+        await video.play();
+      } catch (error: any) {
+        if (error.name === "AbortError") {
+          console.log("[ScreenShare] Play aborted, likely due to source change");
+        } else if (error.name === "NotAllowedError") {
+          console.warn("[ScreenShare] Autoplay prevented:", error);
+        } else {
+          console.error("[ScreenShare] Video play failed:", error);
+        }
+      }
     };
+    
+    // Try to play when metadata is loaded
+    video.onloadedmetadata = () => {
+      safePlay();
+    };
+    
+    // If already loaded, try playing
+    if (video.readyState >= 2) {
+      safePlay();
+    }
 
     return () => {
+      isActive = false;
       if (video) {
+        video.onloadedmetadata = null;
         video.pause();
         video.srcObject = null;
       }
     };
   }, [stream]);
 
+  // Keyboard handlers for accessibility
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Escape key to cancel selection or reset bounding box
+      if (e.key === 'Escape') {
+        if (isSelecting) {
+          setIsSelecting(false);
+          setSelectionStart(null);
+        } else if (!showFullScreen) {
+          resetBoundingBox();
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isSelecting, resetBoundingBox, showFullScreen]);
+
   if (!stream || stream.getVideoTracks().length === 0) {
     return (
-      <div className="w-full h-full flex items-center justify-center bg-gray-800 text-white">
+      <div className="w-full h-full flex items-center justify-center bg-gray-800 text-white rounded-lg">
         <span>No screen share available</span>
       </div>
     );
@@ -228,36 +348,43 @@ function StreamCanvas({
 
   return (
     <>
-      <div className="relative">
+      <div className="relative" aria-label="Screen sharing viewer">
         <video 
           ref={videoRef}
           autoPlay
           playsInline
           muted
           className="hidden"
+          aria-hidden="true"
         />
         <canvas
           ref={canvasRef}
-          width={1280}
-          height={720}
+          width={canvasSize.width}
+          height={canvasSize.height}
           className="w-full h-full rounded-lg cursor-crosshair"
           onMouseDown={handleMouseDown}
           onMouseMove={handleMouseMove}
           onMouseUp={handleMouseUp}
           onMouseLeave={handleMouseUp}
+          role="application"
+          aria-label="Screen sharing canvas. Click and drag to select a region."
+          tabIndex={0}
         />
         <div className="absolute top-2 right-2 bg-black/50 text-white px-2 py-1 rounded text-sm flex gap-2 items-center">
           {!showFullScreen && (
             <button 
               onClick={resetBoundingBox}
-              className="bg-blue-500 text-white rounded px-2 py-0.5 text-xs hover:bg-blue-600"
+              className="bg-blue-500 text-white rounded px-2 py-0.5 text-xs hover:bg-blue-600 transition"
+              aria-label="Reset selection"
             >
               Reset
             </button>
           )}
           <TooltipProvider>
             <Tooltip>
-              <TooltipTrigger>{frameRate} FPS</TooltipTrigger>
+              <TooltipTrigger className="inline-flex items-center">
+                {frameRate} FPS
+              </TooltipTrigger>
               <TooltipContent>
                 <p>Current screen sharing frame rate</p>
               </TooltipContent>
@@ -277,71 +404,166 @@ function StreamCanvas({
 interface ScreenShareProps {
   onStreamReady: (stream: MediaStream) => void;
   frameRate: number;
+  selectedAudioDeviceId?: string;
 }
 
-export function ScreenShare({ onStreamReady, frameRate }: ScreenShareProps) {
+/**
+ * ScreenShare component that manages screen sharing capabilities
+ */
+export function ScreenShare({ onStreamReady, frameRate = 30, selectedAudioDeviceId = "none" }: ScreenShareProps) {
   const [stream, setStream] = useState<MediaStream | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
 
+  // Clean up current stream and set a new one
   const replaceStream = useCallback((newStream: MediaStream | null) => {
     setStream((oldStream) => {
       if (oldStream) {
         oldStream.getTracks().forEach((track) => track.stop());
       }
+      streamRef.current = newStream;
       return newStream;
     });
   }, []);
 
+  // Start screen sharing session
   const startScreenShare = useCallback(async () => {
+    
+    if (frameRate === 0) {
+      return null;
+    }
+
+    console.log("[ScreenShare] Attempting to start screen share");
     try {
-      // Some browsers might not properly handle frameRate in constraints for screen sharing
-      // Create a more compatible set of constraints
+      setError(null);
+      
+      // Check browser support
+      if (!navigator.mediaDevices || typeof navigator.mediaDevices.getDisplayMedia !== 'function') {
+        setError("Screen sharing not supported in this browser");
+        return null;
+      }
+
+      // Create constraints with safe fallbacks
       const constraints: MediaStreamConstraints = {
         video: {
-          frameRate: frameRate ? { ideal: frameRate, max: frameRate } : undefined,
+          frameRate: frameRate > 0 ? { ideal: frameRate, max: Math.min(frameRate * 1.5, 60) } : undefined,
         },
-        audio: false, // Explicitly disable audio for screen sharing
+        audio: false, // We'll handle audio separately if needed
       };
 
-      // Use getDisplayMedia for screen sharing
-      const newStream = await navigator.mediaDevices.getDisplayMedia(constraints);
+      // Use getDisplayMedia with retry mechanism for AbortErrors
+      let retries = 0;
+      const maxRetries = 2;
+      let lastError: Error | null = null;
       
-      // Apply frameRate to video tracks manually if needed
-      if (frameRate && newStream.getVideoTracks().length > 0) {
-        const videoTrack = newStream.getVideoTracks()[0];
+      while (retries <= maxRetries) {
         try {
-          const settings = videoTrack.getSettings();
-          console.log("[ScreenShare] Initial screen share settings:", settings);
+          const newStream = await navigator.mediaDevices.getDisplayMedia(constraints);
           
-          // Some browsers support changing constraints after getting the stream
-          if (videoTrack.applyConstraints) {
-            await videoTrack.applyConstraints({
-              frameRate: { ideal: frameRate, max: frameRate }
-            });
-            console.log(`[ScreenShare] Applied frame rate of ${frameRate} to screen share track`);
+          // Apply frameRate to video tracks manually if needed
+          if (frameRate > 0 && newStream.getVideoTracks().length > 0) {
+            const videoTrack = newStream.getVideoTracks()[0];
+            try {
+              const settings = videoTrack.getSettings();
+              console.log("[ScreenShare] Initial screen share settings:", settings);
+              
+              if (videoTrack.applyConstraints) {
+                await videoTrack.applyConstraints({
+                  frameRate: { ideal: frameRate, max: Math.min(frameRate * 1.5, 60) }
+                });
+                console.log(`[ScreenShare] Applied frame rate of ${frameRate} to screen share track`);
+              }
+            } catch (applyError) {
+              console.warn("[ScreenShare] Couldn't apply frameRate constraint:", applyError);
+            }
           }
-        } catch (applyError) {
-          console.warn("[ScreenShare] Couldn't apply frameRate constraint:", applyError);
+          
+          // Add audio track if audio device is selected
+          if (selectedAudioDeviceId && selectedAudioDeviceId !== "none") {
+            try {
+              console.log(`[ScreenShare] Adding audio from device: ${selectedAudioDeviceId}`);
+              const audioConstraints: MediaStreamConstraints = {
+                audio: {
+                  deviceId: { exact: selectedAudioDeviceId },
+                  sampleRate: 48000,
+                  channelCount: 2,
+                  sampleSize: 16,
+                  echoCancellation: false,
+                  noiseSuppression: false,
+                  autoGainControl: false,
+                }
+              };
+              
+              const audioStream = await navigator.mediaDevices.getUserMedia(audioConstraints);
+              const audioTrack = audioStream.getAudioTracks()[0];
+              
+              if (audioTrack) {
+                newStream.addTrack(audioTrack);
+                console.log("[ScreenShare] Successfully added audio track");
+              }
+            } catch (audioError) {
+              console.error("[ScreenShare] Failed to add audio track:", audioError);
+            }
+          }
+          
+          // Handle stream stop when user clicks "Stop Sharing"
+          const videoTrack = newStream.getVideoTracks()[0];
+          if (videoTrack) {
+            videoTrack.onended = () => {
+              console.log("[ScreenShare] User ended screen sharing");
+              replaceStream(null);
+            };
+          }
+
+          return newStream;
+        } catch (error: any) {
+          lastError = error;
+          
+          if (error.name === "NotAllowedError") {
+            console.warn("[ScreenShare] User denied screen sharing permission");
+            setError("Screen sharing permission denied");
+            break;
+          } else if (error.name === "AbortError" && error.message === "Invalid state") {
+            console.warn(`[ScreenShare] AbortError: Invalid state (Retry ${retries + 1}/${maxRetries + 1})`);
+            retries++;
+            // Add a short delay before retrying
+            await new Promise(resolve => setTimeout(resolve, 300));
+          } else {
+            // For other errors, break immediately
+            break;
+          }
         }
       }
       
-      // Handle stream stop when user clicks "Stop Sharing"
-      newStream.getVideoTracks()[0].onended = () => {
-        replaceStream(null);
-      };
-
-      return newStream;
-    } catch (error) {
-      console.error("Error accessing screen sharing:", error);
+      // If we've exhausted retries or have another error
+      if (lastError) {
+        console.error("[ScreenShare] Error accessing screen sharing:", lastError);
+        setError(`Screen sharing error: ${lastError.message || lastError.name}`);
+      }
+      return null;
+    } catch (error: any) {
+      console.error("[ScreenShare] Error accessing screen sharing:", error);
+      setError(`Screen sharing error: ${error.message || "Unknown error"}`);
       return null;
     }
-  }, [frameRate, replaceStream]);
+  }, [frameRate, replaceStream, selectedAudioDeviceId]);
 
+  // Initialize screen sharing when component mounts or frameRate changes
   useEffect(() => {
     if (frameRate === 0) return;
 
-    console.log("[ScreenShare] Starting screen share with frame rate:", frameRate);
+    let isComponentMounted = true;
+    console.log("[ScreenShare] Starting screen share with frame rate:", frameRate, "audio device:", selectedAudioDeviceId);
     
     startScreenShare().then((newStream) => {
+      // Only proceed if component is still mounted
+      if (!isComponentMounted) {
+        if (newStream) {
+          newStream.getTracks().forEach(track => track.stop());
+        }
+        return;
+      }
+      
       if (newStream) {
         console.log("[ScreenShare] Screen share stream obtained:", 
           `Video tracks: ${newStream.getVideoTracks().length}`,
@@ -349,7 +571,6 @@ export function ScreenShare({ onStreamReady, frameRate }: ScreenShareProps) {
         );
         
         replaceStream(newStream);
-        setStream(newStream);
         
         // Log track information
         newStream.getTracks().forEach(track => {
@@ -364,25 +585,57 @@ export function ScreenShare({ onStreamReady, frameRate }: ScreenShareProps) {
         console.warn("[ScreenShare] Failed to get screen share stream");
       }
     }).catch(error => {
-      console.error("[ScreenShare] Error in screen sharing effect:", error);
+      if (isComponentMounted) {
+        console.error("[ScreenShare] Error in screen sharing effect:", error);
+        setError(`Screen sharing error: ${error.message || "Unknown error"}`);
+      }
     });
 
     return () => {
+      isComponentMounted = false;
       console.log("[ScreenShare] Cleaning up screen share");
+      
+      // Ensure we stop all tracks
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => {
+          try {
+            track.stop();
+          } catch (e) {
+            console.warn("[ScreenShare] Error stopping track:", e);
+          }
+        });
+      }
+      
       replaceStream(null);
     };
-  }, [frameRate, startScreenShare, replaceStream, onStreamReady]);
+  }, [frameRate, startScreenShare, replaceStream, onStreamReady, selectedAudioDeviceId]);
 
+  // Show error message if there's an error
+  if (error) {
+    return (
+      <div className="w-full p-4 bg-red-100 border border-red-300 rounded-lg text-red-700">
+        <p>{error}</p>
+        <button 
+          onClick={() => startScreenShare()}
+          className="mt-2 bg-red-600 text-white px-3 py-1 rounded hover:bg-red-700 transition"
+        >
+          Try Again
+        </button>
+      </div>
+    );
+  }
+
+  // Don't render anything until we have a stream
   if (!stream || stream.getVideoTracks().length === 0) {
     return null;
   }
 
   return (
-    <div>
+    <div className="screen-share-container">
       <StreamCanvas
         stream={stream}
         frameRate={frameRate}
-        onStreamReady={() => {}} // Already handled in parent component
+        onStreamReady={onStreamReady}
       />
     </div>
   );

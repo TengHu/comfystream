@@ -4,10 +4,15 @@ import React, { useState } from "react";
 import { ControlPanel } from "./control-panel";
 import { Button } from "./ui/button";
 import { Drawer, DrawerContent, DrawerTitle } from "./ui/drawer";
-import { Settings } from "lucide-react";
+import { Settings, Sliders } from "lucide-react";
 import { Plus } from "lucide-react"; // Import Plus icon for minimal add button
 
-export const ControlPanelsContainer = () => {
+interface ControlPanelsContainerProps {
+  isConnected?: boolean;
+  onSettingsOpen?: () => void;
+}
+
+export const ControlPanelsContainer = ({ isConnected, onSettingsOpen }: ControlPanelsContainerProps = {}) => {
   const [panels, setPanels] = useState<number[]>([0]); // Start with one panel
   const [nextPanelId, setNextPanelId] = useState(1);
   const [isOpen, setIsOpen] = useState(false);
@@ -69,13 +74,25 @@ export const ControlPanelsContainer = () => {
 
   return (
     <>
-      <Button
-        onClick={() => setIsOpen(true)}
-        className="fixed bottom-4 right-4 h-12 w-12 rounded-full p-0 shadow-lg hover:shadow-xl transition-shadow"
-        variant="default"
-      >
-        <Settings className="h-6 w-6" />
-      </Button>
+      <div className="fixed bottom-4 right-4 flex flex-col gap-2">
+        {onSettingsOpen && (
+          <Button
+            onClick={onSettingsOpen}
+            className="h-12 w-12 rounded-full p-0 shadow-lg hover:shadow-xl transition-shadow"
+            variant="secondary"
+          >
+            <Settings className="h-6 w-6" />
+          </Button>
+        )}
+        
+        <Button
+          onClick={() => setIsOpen(true)}
+          className="h-12 w-12 rounded-full p-0 shadow-lg hover:shadow-xl transition-shadow"
+          variant="default"
+        >
+          <Sliders className="h-6 w-6" />
+        </Button>
+      </div>
 
       <Drawer
         open={isOpen}
