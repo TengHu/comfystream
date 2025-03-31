@@ -268,6 +268,7 @@ export const Room = () => {
                     selectedAudioDeviceId={config.selectedAudioDeviceId}
                   />
                 )} */}
+                
                 <ScreenShare
                     onStreamReady={onStreamReady}
                     frameRate={config.frameRate}

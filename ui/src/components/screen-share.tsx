@@ -22,6 +22,7 @@ function StreamCanvas({
   const videoRef = useRef<HTMLVideoElement>(null);
   const animationRef = useRef<number>(0);
   const [canvasSize, setCanvasSize] = useState({ width: 1280, height: 720 });
+  const outputStreamRef = useRef<MediaStream | null>(null);
   
   // Selection state
   const [isSelecting, setIsSelecting] = useState(false);
@@ -43,6 +44,41 @@ function StreamCanvas({
     scaleX: number;
     scaleY: number;
   } | null>(null);
+
+  // Create a consistent MediaStream from canvas
+  useEffect(() => {
+    if (!canvasRef.current || !stream) return;
+
+    // Clean up previous stream if it exists
+    if (outputStreamRef.current) {
+      outputStreamRef.current.getTracks().forEach(track => track.stop());
+    }
+
+    try {
+      // Create a stream from the canvas with fixed resolution
+      const canvas = canvasRef.current;
+      const outputStream = canvas.captureStream(frameRate || 30);
+      
+      // Add audio tracks from the original stream if they exist
+      stream.getAudioTracks().forEach(track => {
+        outputStream.addTrack(track);
+      });
+      
+      // Save reference to the new stream and pass to parent
+      outputStreamRef.current = outputStream;
+      onStreamReady(outputStream);
+      
+      console.log("[ScreenShare] Created canvas-based output stream with resolution:", canvas.width, "x", canvas.height);
+    } catch (error) {
+      console.error("[ScreenShare] Failed to create canvas stream:", error);
+    }
+
+    return () => {
+      if (outputStreamRef.current) {
+        outputStreamRef.current.getTracks().forEach(track => track.stop());
+      }
+    };
+  }, [stream, frameRate, onStreamReady]);
 
   // Convert canvas coordinates to video coordinates
   const canvasToVideoCoords = useCallback((canvasX: number, canvasY: number) => {
@@ -137,7 +173,7 @@ function StreamCanvas({
   useEffect(() => {
     const handleResize = () => {
       if (canvasRef.current) {
-        // Maintain 16:9 aspect ratio while updating size
+        // Fix canvas to 1280x720 resolution (16:9 aspect ratio)
         setCanvasSize({
           width: 1280,
           height: 720
@@ -145,9 +181,11 @@ function StreamCanvas({
       }
     };
 
-    window.addEventListener('resize', handleResize);
+    // Set initial size
     handleResize();
-    return () => window.removeEventListener('resize', handleResize);
+    
+    // No need to listen for resize events since we want a fixed canvas size
+    return () => {};
   }, []);
 
   // Draw function for rendering video on canvas
@@ -447,6 +485,8 @@ export function ScreenShare({ onStreamReady, frameRate = 30, selectedAudioDevice
       const constraints: MediaStreamConstraints = {
         video: {
           frameRate: frameRate > 0 ? { ideal: frameRate, max: Math.min(frameRate * 1.5, 60) } : undefined,
+          width: { ideal: 1280, max: 1920 },
+          height: { ideal: 720, max: 1080 },
         },
         audio: false, // We'll handle audio separately if needed
       };
@@ -469,9 +509,11 @@ export function ScreenShare({ onStreamReady, frameRate = 30, selectedAudioDevice
               
               if (videoTrack.applyConstraints) {
                 await videoTrack.applyConstraints({
-                  frameRate: { ideal: frameRate, max: Math.min(frameRate * 1.5, 60) }
+                  frameRate: { ideal: frameRate, max: Math.min(frameRate * 1.5, 60) },
+                  width: { ideal: 1280, max: 1920 },
+                  height: { ideal: 720, max: 1080 },
                 });
-                console.log(`[ScreenShare] Applied frame rate of ${frameRate} to screen share track`);
+                console.log(`[ScreenShare] Applied constraints to screen share track`);
               }
             } catch (applyError) {
               console.warn("[ScreenShare] Couldn't apply frameRate constraint:", applyError);
@@ -579,8 +621,8 @@ export function ScreenShare({ onStreamReady, frameRate = 30, selectedAudioDevice
           console.log("[ScreenShare] Track settings:", settings);
         });
         
-        // Call the onStreamReady callback from the parent component
-        onStreamReady(newStream);
+        // Canvas will handle passing the processed stream to onStreamReady
+        // We don't call onStreamReady(newStream) directly anymore
       } else {
         console.warn("[ScreenShare] Failed to get screen share stream");
       }
